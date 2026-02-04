@@ -1,0 +1,31 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Logs & runtime
+logs/
+*.log
+
+# Local configs
+.env
+
+# Build
+dist/
+build/
+*.egg-info/
