@@ -15,13 +15,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--packet-format", type=int, default=None, help="m_packetFormat esperado (default: 2025)")
     p.add_argument("--game-year", type=int, default=None, help="m_gameYear esperado (default: 25)")
     p.add_argument("--queue-maxsize", type=int, default=None, help="Tamaño de cola (default: 2048)")
-    p.add_argument("--stats-interval", type=float, default=None, help="Segundos entre stats (default: 2.0)")
     p.add_argument(
         "--log-level",
         default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Nivel de log (default: INFO)",
     )
+
+    # recorder/replay
+    p.add_argument("--record", action="store_true", help="Grabar UDP crudo a archivo")
+    p.add_argument("--record-dir", default=None, help="Carpeta de grabación (default: recordings)")
+    p.add_argument("--replay", default=None, help="Reproducir desde archivo .ingrec (sin UDP)")
+    p.add_argument("--replay-speed", type=float, default=None, help="Velocidad replay (default: 1.0)")
+    p.add_argument("--replay-no-sleep", action="store_true", help="Replay lo más rápido posible")
+
     p.add_argument("--no-supervisor", action="store_true", help="Ejecutar sin auto-restart")
     return p
 
@@ -35,8 +42,12 @@ def main(argv: list[str] | None = None) -> int:
         packet_format=args.packet_format,
         game_year=args.game_year,
         queue_maxsize=args.queue_maxsize,
-        stats_interval_s=args.stats_interval,
         log_level=args.log_level,
+        record_enabled=args.record,
+        record_dir=args.record_dir,
+        replay_path=args.replay,
+        replay_speed=args.replay_speed,
+        replay_no_sleep=args.replay_no_sleep,
     )
 
     if args.no_supervisor:
