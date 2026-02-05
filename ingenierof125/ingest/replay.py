@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from typing import BinaryIO, Optional
 
 
-MAGIC = b\"INGREC1\\0\"
-_HEADER = struct.Struct(\"<8sH\")
-_RECORD = struct.Struct(\"<QI\")
+MAGIC = b"INGREC1\0"              # 8 bytes
+_HEADER = struct.Struct("<8sH")   # magic + u16 version
+_RECORD = struct.Struct("<QI")    # u64 ts_ns + u32 length
 
 
 @dataclass(slots=True)
@@ -22,7 +22,7 @@ class PacketReplayer:
         self._path = path
         self._speed = max(0.01, float(speed))
         self._no_sleep = bool(no_sleep)
-        self._log = logging.getLogger(\"ingenierof125.replay\")
+        self._log = logging.getLogger("ingenierof125.replay")
         self._stop = asyncio.Event()
         self.stats = ReplayStats()
 
@@ -30,21 +30,23 @@ class PacketReplayer:
         self._stop.set()
 
     def _open(self) -> BinaryIO:
-        f = open(self._path, \"rb\")
-        magic, ver = _HEADER.unpack(f.read(_HEADER.size))
+        f = open(self._path, "rb")
+        header = f.read(_HEADER.size)
+        if len(header) != _HEADER.size:
+            raise ValueError("Replay: header incompleto")
+        magic, ver = _HEADER.unpack(header)
         if magic != MAGIC:
-            raise ValueError(\"Replay: magic inválido (no es archivo ingrec)\")
+            raise ValueError("Replay: magic inválido (no es archivo ingrec)")
         if ver != 1:
-            raise ValueError(f\"Replay: versión no soportada: {ver}\")
+            raise ValueError(f"Replay: versión no soportada: {ver}")
         return f
 
-    async def run(self, out_queue: \"asyncio.Queue[bytes]\") -> None:
-        self._log.info(\"Replaying %s (speed=%.2f no_sleep=%s)\", self._path, self._speed, self._no_sleep)
+    async def run(self, out_queue: "asyncio.Queue[bytes]") -> None:
+        self._log.info("Replaying %s (speed=%.2f no_sleep=%s)", self._path, self._speed, self._no_sleep)
 
         f: Optional[BinaryIO] = None
         try:
             f = self._open()
-            first_ts: int | None = None
             last_ts: int | None = None
 
             while not self._stop.is_set():
@@ -57,11 +59,7 @@ class PacketReplayer:
                 if len(payload) != length:
                     break
 
-                if first_ts is None:
-                    first_ts = ts_ns
-                    last_ts = ts_ns
-
-                if not self._no_sleep and last_ts is not None:
+                if (not self._no_sleep) and (last_ts is not None):
                     dt_ns = ts_ns - last_ts
                     if dt_ns > 0:
                         await asyncio.sleep((dt_ns / 1e9) / self._speed)
@@ -72,4 +70,4 @@ class PacketReplayer:
         finally:
             if f:
                 f.close()
-            self._log.info(\"Replay finished: sent=%s\", self.stats.sent)
+            self._log.info("Replay finished: sent=%s", self.stats.sent)
