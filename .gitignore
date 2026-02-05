@@ -34,3 +34,6 @@ build/
 recordings/
 *.ingrec
 
+# Recordings (NO van al repo)
+# Patches locales
+patch.diff
