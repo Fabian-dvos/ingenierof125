@@ -5,7 +5,6 @@ import logging
 
 from ingenierof125.core.config import AppConfig
 from ingenierof125.core.logging_setup import setup_logging
-from ingenierof125.core.stats import RuntimeStats, StatsReporter
 from ingenierof125.ingest.recorder import PacketRecorder
 from ingenierof125.ingest.replay import PacketReplayer
 from ingenierof125.telemetry.dispatcher import PacketDispatcher
@@ -16,27 +15,19 @@ async def run_app(cfg: AppConfig) -> None:
     setup_logging(cfg)
     log = logging.getLogger("ingenierof125")
 
+    # Cola interna para datagramas crudos (solo en modo UDP)
     raw_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=cfg.queue_maxsize)
+    # Cola que consume el dispatcher (modo UDP o REPLAY)
     dispatch_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=cfg.queue_maxsize)
 
-    stats = RuntimeStats()
-
-    dispatcher = PacketDispatcher(expected_packet_format=cfg.packet_format, expected_game_year=cfg.game_year, stats=stats)
+    dispatcher = PacketDispatcher(expected_packet_format=cfg.packet_format, expected_game_year=cfg.game_year)
     recorder = PacketRecorder(out_dir=cfg.record_dir, enabled=cfg.record_enabled)
-    reporter = StatsReporter(
-        stats=stats,
-        interval_s=cfg.stats_interval_s,
-        raw_queue=None if cfg.replay_path else raw_queue,
-        dispatch_queue=dispatch_queue,
-        recorder=recorder,
-    )
 
     listener: UdpListener | None = None
     replayer: PacketReplayer | None = None
 
     tasks: list[asyncio.Task] = []
     tasks.append(asyncio.create_task(dispatcher.run(dispatch_queue), name="packet-dispatcher"))
-    tasks.append(asyncio.create_task(reporter.run(), name="stats-reporter"))
 
     if cfg.record_enabled:
         tasks.append(asyncio.create_task(recorder.run(), name="udp-recorder"))
@@ -46,36 +37,24 @@ async def run_app(cfg: AppConfig) -> None:
         replayer = PacketReplayer(path=cfg.replay_path, speed=cfg.replay_speed, no_sleep=cfg.replay_no_sleep)
 
         async def _replay_fanout() -> None:
+            # En replay, los paquetes van directo a dispatch_queue,
+            # pero si record está activo, también los guardamos.
             tmp_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=cfg.queue_maxsize)
-            replay_task = asyncio.create_task(replayer.run(tmp_queue), name="udp-replayer")
+            replay_task = asyncio.create_task(replayer.run(tmp_queue), name="udp-replayer-inner")
             try:
                 while True:
-                    get_task = asyncio.create_task(tmp_queue.get())
-                    done, _ = await asyncio.wait({get_task, replay_task}, return_when=asyncio.FIRST_COMPLETED)
-
-                    if replay_task in done:
-                        get_task.cancel()
-                        break
-
-                    data = get_task.result()
-                    stats.replay_sent += 1
-
+                    data = await tmp_queue.get()
                     if cfg.record_enabled:
                         recorder.try_enqueue(data)
-
                     await dispatch_queue.put(data)
             finally:
-                # al terminar el replay, apagamos todo para salir limpio
-                reporter.stop()
-                dispatcher.stop()
-                recorder.stop()
-                replayer.stop()
+                replay_task.cancel()
 
         tasks.append(asyncio.create_task(_replay_fanout(), name="replay-fanout"))
 
     else:
         log.info("Mode=UDP listen=%s:%s record=%s", cfg.udp_host, cfg.udp_port, cfg.record_enabled)
-        listener = UdpListener(cfg.udp_host, cfg.udp_port, raw_queue, drop_when_full=True, stats=stats)
+        listener = UdpListener(cfg.udp_host, cfg.udp_port, raw_queue, drop_when_full=True)
         tasks.append(asyncio.create_task(listener.run(), name="udp-listener"))
 
         async def _udp_fanout() -> None:
@@ -91,7 +70,6 @@ async def run_app(cfg: AppConfig) -> None:
         await asyncio.gather(*tasks)
     finally:
         log.info("Shutting down...")
-        reporter.stop()
         dispatcher.stop()
         recorder.stop()
         if listener:

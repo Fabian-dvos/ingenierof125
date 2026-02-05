@@ -29,3 +29,8 @@ logs/
 dist/
 build/
 *.egg-info/
+
+# Recordings
+recordings/
+*.ingrec
+
