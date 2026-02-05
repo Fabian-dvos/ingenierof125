@@ -39,7 +39,6 @@ class AppConfig:
 
     queue_maxsize: int = 2048
     stats_interval_s: float = 2.0
-    state_interval_s: float = 1.0
 
     log_level: str = "INFO"
     log_dir: str = "logs"
@@ -61,7 +60,6 @@ class AppConfig:
             game_year=_env_int("ING_GAME_YEAR", 25),
             queue_maxsize=_env_int("ING_QUEUE_MAXSIZE", 2048),
             stats_interval_s=_env_float("ING_STATS_INTERVAL_S", 2.0),
-            state_interval_s=_env_float("ING_STATE_INTERVAL_S", 1.0),
             log_level=_env("ING_LOG_LEVEL", "INFO").upper(),
             log_dir=_env("ING_LOG_DIR", "logs"),
             log_file=_env("ING_LOG_FILE", "ingenierof125.log"),
@@ -75,7 +73,6 @@ class AppConfig:
         game_year: int | None = None,
         queue_maxsize: int | None = None,
         stats_interval_s: float | None = None,
-        state_interval_s: float | None = None,
         log_level: str | None = None,
         record_enabled: bool | None = None,
         record_dir: str | None = None,
@@ -91,7 +88,6 @@ class AppConfig:
             game_year=self.game_year if game_year is None else game_year,
             queue_maxsize=self.queue_maxsize if queue_maxsize is None else queue_maxsize,
             stats_interval_s=self.stats_interval_s if stats_interval_s is None else float(stats_interval_s),
-            state_interval_s=self.state_interval_s if state_interval_s is None else float(state_interval_s),
             log_level=self.log_level if log_level is None else log_level,
             record_enabled=self.record_enabled if record_enabled is None else bool(record_enabled),
             record_dir=self.record_dir if record_dir is None else record_dir,

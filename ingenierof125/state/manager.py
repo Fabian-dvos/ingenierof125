@@ -1,0 +1,159 @@
+﻿from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass
+from typing import Optional
+
+from ingenierof125.state.model import EngineerState
+from ingenierof125.telemetry.decoders_lite import (
+    compound_name,
+    decode_damage_player,
+    decode_lap_player,
+    decode_session,
+    decode_status_player,
+    decode_telemetry_player,
+)
+
+log = logging.getLogger("ingenierof125.state")
+
+
+@dataclass(frozen=True, slots=True)
+class Ttls:
+    session: float = 5.0
+    lap: float = 1.5
+    status: float = 1.5
+    telemetry: float = 0.6
+    damage: float = 2.0
+
+
+@dataclass(frozen=True, slots=True)
+class StaleFlags:
+    session: bool
+    lap: bool
+    status: bool
+    telemetry: bool
+    damage: bool
+
+
+class StateManager:
+    def __init__(self, ttls: Optional[Ttls] = None) -> None:
+        self._state = EngineerState()
+        self._ttls = ttls or Ttls()
+
+    @property
+    def state(self) -> EngineerState:
+        return self._state
+
+    def _update_latest_t(self, t: float) -> None:
+        if t > self._state.latest_session_time:
+            self._state.latest_session_time = t
+
+    @staticmethod
+    def _good_t(t: float) -> bool:
+        return isinstance(t, float) and (not math.isnan(t)) and (not math.isinf(t)) and t >= 0.0
+
+    def apply_packet(self, packet_id: int, payload: bytes, session_time: float, player_index: int) -> None:
+        # last-known-good player index
+        if 0 <= player_index < 22:
+            self._state.player_index = int(player_index)
+
+        if self._good_t(session_time):
+            self._update_latest_t(session_time)
+        else:
+            # sin tiempo consistente, no tocamos TTLs
+            session_time = self._state.latest_session_time
+
+        idx = self._state.player_index
+
+        try:
+            if packet_id == 1:
+                v = decode_session(payload)
+                if v is not None:
+                    self._state.session.value = v
+                    self._state.session.t = session_time
+                    self._state.session.ok = True
+
+            elif packet_id == 2:
+                v = decode_lap_player(payload, idx)
+                if v is not None:
+                    self._state.lap.value = v
+                    self._state.lap.t = session_time
+                    self._state.lap.ok = True
+
+            elif packet_id == 6:
+                v = decode_telemetry_player(payload, idx)
+                if v is not None:
+                    self._state.telemetry.value = v
+                    self._state.telemetry.t = session_time
+                    self._state.telemetry.ok = True
+
+            elif packet_id == 7:
+                v = decode_status_player(payload, idx)
+                if v is not None:
+                    self._state.status.value = v
+                    self._state.status.t = session_time
+                    self._state.status.ok = True
+
+            elif packet_id == 10:
+                v = decode_damage_player(payload, idx)
+                if v is not None:
+                    self._state.damage.value = v
+                    self._state.damage.t = session_time
+                    self._state.damage.ok = True
+
+        except Exception:
+            self._state.decode_errors += 1
+
+    def stale_flags(self, now_t: Optional[float] = None) -> StaleFlags:
+        t = self._state.latest_session_time if now_t is None else float(now_t)
+
+        def stale(last_t: float, ttl: float, ok: bool) -> bool:
+            if not ok or last_t < 0.0 or t < 0.0:
+                return True
+            return (t - last_t) > ttl
+
+        return StaleFlags(
+            session=stale(self._state.session.t, self._ttls.session, self._state.session.ok),
+            lap=stale(self._state.lap.t, self._ttls.lap, self._state.lap.ok),
+            status=stale(self._state.status.t, self._ttls.status, self._state.status.ok),
+            telemetry=stale(self._state.telemetry.t, self._ttls.telemetry, self._state.telemetry.ok),
+            damage=stale(self._state.damage.t, self._ttls.damage, self._state.damage.ok),
+        )
+
+    def format_one_line(self) -> str:
+        s = self._state
+        st = self.stale_flags()
+
+        parts = []
+
+        if s.lap.value:
+            lap = s.lap.value
+            parts.append(f"lap={lap.lap_num} pos={lap.position} sec={lap.sector} pen={lap.penalties_s}s")
+        else:
+            parts.append("lap=--")
+
+        if s.status.value:
+            ss = s.status.value
+            parts.append(f"fuel={ss.fuel_in_tank:.2f} remLaps={ss.fuel_remaining_laps:.2f} tyre={compound_name(ss.actual_compound, ss.visual_compound)} age={ss.tyre_age_laps} DRSok={ss.drs_allowed}")
+        else:
+            parts.append("fuel=--")
+
+        if s.telemetry.value:
+            te = s.telemetry.value
+            parts.append(f"v={te.speed_kph} thr={te.throttle:.2f} brk={te.brake:.2f} gear={te.gear} drs={te.drs} rpm={te.engine_rpm}")
+        else:
+            parts.append("telem=--")
+
+        if s.damage.value:
+            dm = s.damage.value
+            wear_max = max(dm.wear) if dm.wear else 0.0
+            parts.append(f"wearMax={wear_max:.0f}% wingL={dm.front_left_wing}% wingR={dm.front_right_wing}% gb={dm.gearbox_damage}% eng={dm.engine_damage}%")
+        else:
+            parts.append("dmg=--")
+
+        stale_str = f"stale(session={st.session} lap={st.lap} status={st.status} telem={st.telemetry} dmg={st.damage})"
+        parts.append(stale_str)
+        parts.append(f"t={s.latest_session_time:.3f} player={s.player_index} decErr={s.decode_errors}")
+
+        return " | ".join(parts)
