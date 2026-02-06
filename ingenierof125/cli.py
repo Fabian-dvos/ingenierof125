@@ -18,6 +18,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stats-interval", type=float, default=None, help="Segundos entre logs de salud (default: 2.0)")
     p.add_argument("--state-interval", type=float, default=None, help="Segundos entre snapshots de estado (default: 1.0)")
 
+    ap.add_argument("--no-engine", action="store_true", help="Disable rules/priority engine")
+    ap.add_argument("--rules-path", type=str, default="rules/v1.json", help="Rules JSON path")
+    ap.add_argument("--comm-throttle", type=float, default=0.0, help="Override throttle seconds (0=rules)")
+
     p.add_argument(
         "--log-level",
         default=None,

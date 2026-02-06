@@ -380,10 +380,10 @@ def decode_damage_player(payload: bytes, player_idx: int) -> Optional[PlayerDama
     # 8 brakesDamage[4] (4B) => idx 8..11
     # then: frontLeftWing(1), frontRightWing(1), rearWing(1), floor(1), diffuser(1), sidepod(1),
     # drsFault(1), ersFault(1), gearbox(1), engine(1), +18 bytes
-    front_left_wing = int(unpacked[12])
-    front_right_wing = int(unpacked[13])
-    gearbox_damage = int(unpacked[20])
-    engine_damage = int(unpacked[21])
+    front_left_wing = int(unpacked[16])
+    front_right_wing = int(unpacked[17])
+    gearbox_damage = int(unpacked[24])
+    engine_damage = int(unpacked[25])
 
     return PlayerDamageLite(
         wear=(wear[0], wear[1], wear[2], wear[3]),
@@ -392,3 +392,4 @@ def decode_damage_player(payload: bytes, player_idx: int) -> Optional[PlayerDama
         gearbox_damage=gearbox_damage,
         engine_damage=engine_damage,
     )
+

@@ -1,0 +1,17 @@
+﻿{
+  "version": "v1",
+  "comms": {
+    "throttle_seconds": 12
+  },
+  "cooldowns": {
+    "fuel_low": 25,
+    "penalty": 10,
+    "wing_damage": 30
+  },
+  "thresholds": {
+    "fuel_rem_laps_low": 2.0,
+    "fuel_rem_laps_critical": 1.0,
+    "wing_damage_warn": 25,
+    "wing_damage_critical": 60
+  }
+}

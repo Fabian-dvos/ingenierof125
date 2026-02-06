@@ -11,6 +11,10 @@ from ingenierof125.ingest.replay import PacketReplayer
 from ingenierof125.state.manager import StateManager
 from ingenierof125.telemetry.dispatcher import PacketDispatcher
 from ingenierof125.telemetry.udp_listener import UdpListener
+from ingenierof125.engine.engine import EngineerEngine
+from ingenierof125.rules.load import load_rules, default_rules_path
+from ingenierof125.comms.logger_sink import LoggerComms
+
 
 
 async def run_app(cfg: AppConfig) -> None:
@@ -23,6 +27,21 @@ async def run_app(cfg: AppConfig) -> None:
 
     stats = RuntimeStats()
     state = StateManager()
+
+    engine_task = None
+    engine = None
+    try:
+        if (not getattr(args, 'no_engine', False)) and float(getattr(args, 'state_interval', 0) or 0) > 0:
+            rules_path = getattr(args, 'rules_path', None) or str(default_rules_path())
+            cfg = load_rules(rules_path)
+            override = float(getattr(args, 'comm_throttle', 0) or 0)
+            cfg = cfg.override(throttle_s=override)
+            engine = EngineerEngine.create(cfg, LoggerComms())
+            engine_task = asyncio.create_task(_engine_loop(state_mgr, engine, float(getattr(args, 'state_interval'))))
+    except Exception:
+        import logging
+        logging.getLogger('ingenierof125').exception('Engine init failed (continuing without engine)')
+
 
     dispatcher = PacketDispatcher(
         expected_packet_format=cfg.packet_format,
@@ -118,3 +137,19 @@ async def run_app(cfg: AppConfig) -> None:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _engine_loop(state_mgr, engine, interval_s: float) -> None:
+    import asyncio
+
+    interval = max(0.2, float(interval_s))
+    while True:
+        await asyncio.sleep(interval)
+        # leer estado de forma tolerante
+        st = getattr(state_mgr, "state", None)
+        if st is None and hasattr(state_mgr, "get_state"):
+            st = state_mgr.get_state()
+        if st is None:
+            continue
+        t = getattr(st, "latest_session_time", -1.0)
+        engine.tick(st, float(t))
