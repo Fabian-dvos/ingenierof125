@@ -18,6 +18,8 @@ from ingenierof125.comms.logger_sink import LoggerComms
 
 
 async def run_app(cfg: AppConfig) -> None:
+    args = cfg
+    cfg = AppConfig.from_obj(args)
     setup_logging(cfg)
     log = logging.getLogger("ingenierof125")
     state_log = logging.getLogger("ingenierof125.state_snapshot")
@@ -39,7 +41,6 @@ async def run_app(cfg: AppConfig) -> None:
             engine = EngineerEngine.create(cfg, LoggerComms())
             engine_task = asyncio.create_task(_engine_loop(state_mgr, engine, float(getattr(args, 'state_interval'))))
     except Exception:
-        import logging
         logging.getLogger('ingenierof125').exception('Engine init failed (continuing without engine)')
 
 
@@ -153,3 +154,6 @@ async def _engine_loop(state_mgr, engine, interval_s: float) -> None:
             continue
         t = getattr(st, "latest_session_time", -1.0)
         engine.tick(st, float(t))
+
+
+

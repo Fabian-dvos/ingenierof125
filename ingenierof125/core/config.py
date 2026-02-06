@@ -1,101 +1,114 @@
 ﻿from __future__ import annotations
 
-import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from typing import Any
 
 
-def _env(name: str, default: str) -> str:
-    v = os.getenv(name)
-    return default if v is None or v.strip() == "" else v.strip()
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
-        return default
+def _as_int(v: Any, default: int) -> int:
     try:
-        return int(v.strip())
-    except ValueError:
+        x = int(v)
+        return x if x > 0 else default
+    except Exception:
         return default
 
 
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
-        return default
+def _as_float(v: Any, default: float) -> float:
     try:
-        return float(v.strip())
-    except ValueError:
+        return float(v)
+    except Exception:
         return default
 
 
-@dataclass(frozen=True, slots=True)
+def _as_bool(v: Any, default: bool) -> bool:
+    try:
+        return bool(v)
+    except Exception:
+        return default
+
+
+def _as_str(v: Any, default: str) -> str:
+    try:
+        s = str(v)
+        return s if s else default
+    except Exception:
+        return default
+
+
+@dataclass(slots=True)
 class AppConfig:
-    udp_host: str = "0.0.0.0"
-    udp_port: int = 20777
-
-    packet_format: int = 2025
-    game_year: int = 25
-
-    queue_maxsize: int = 2048
-    stats_interval_s: float = 2.0
-    state_interval_s: float = 1.0
-
+    # logging
     log_level: str = "INFO"
     log_dir: str = "logs"
-    log_file: str = "ingenierof125.log"
 
-    # recording / replay
-    record_enabled: bool = False
-    record_dir: str = "recordings"
-    replay_path: str | None = None
+    # protocol expectations
+    packet_format: int = 2025  # F1 25 UDP "format" (m_packetFormat)
+
+    # mode
+    listen: str = "0.0.0.0:20777"
+    replay: str = ""
     replay_speed: float = 1.0
     replay_no_sleep: bool = False
 
-    @staticmethod
-    def from_env() -> "AppConfig":
-        return AppConfig(
-            udp_host=_env("ING_UDP_HOST", "0.0.0.0"),
-            udp_port=_env_int("ING_UDP_PORT", 20777),
-            packet_format=_env_int("ING_PACKET_FORMAT", 2025),
-            game_year=_env_int("ING_GAME_YEAR", 25),
-            queue_maxsize=_env_int("ING_QUEUE_MAXSIZE", 2048),
-            stats_interval_s=_env_float("ING_STATS_INTERVAL_S", 2.0),
-            state_interval_s=_env_float("ING_STATE_INTERVAL_S", 1.0),
-            log_level=_env("ING_LOG_LEVEL", "INFO").upper(),
-            log_dir=_env("ING_LOG_DIR", "logs"),
-            log_file=_env("ING_LOG_FILE", "ingenierof125.log"),
+    # queues
+    queue_maxsize: int = 2048
+    dispatch_maxsize: int = 2048
+
+    # recording
+    record: bool = False
+    record_dir: str = "recordings"
+
+    # observability
+    stats_interval: float = 0.0
+    state_interval: float = 0.0
+
+    # engine/rules
+    no_engine: bool = False
+    rules_path: str = "rules/v1.json"
+    comm_throttle: float = 0.0
+
+    # supervisor
+    no_supervisor: bool = False
+
+    @classmethod
+    def from_obj(cls, obj: Any) -> "AppConfig":
+        """
+        Construye config estable desde argparse.Namespace o cualquier objeto con atributos.
+        IMPORTANTE: con dataclass(slots=True) NO usar cls.campo como default (es member_descriptor).
+        """
+        base = cls()  # << defaults REALES
+
+        get = getattr
+        cfg = cls(
+            log_level=_as_str(get(obj, "log_level", base.log_level), base.log_level),
+            log_dir=_as_str(get(obj, "log_dir", base.log_dir), base.log_dir),
+
+            packet_format=_as_int(get(obj, "packet_format", base.packet_format), base.packet_format),
+
+            listen=_as_str(get(obj, "listen", base.listen), base.listen),
+            replay=_as_str(get(obj, "replay", base.replay), base.replay),
+            replay_speed=_as_float(get(obj, "replay_speed", base.replay_speed), base.replay_speed),
+            replay_no_sleep=_as_bool(get(obj, "replay_no_sleep", base.replay_no_sleep), base.replay_no_sleep),
+
+            queue_maxsize=_as_int(get(obj, "queue_maxsize", base.queue_maxsize), base.queue_maxsize),
+            dispatch_maxsize=_as_int(get(obj, "dispatch_maxsize", base.dispatch_maxsize), base.dispatch_maxsize),
+
+            record=_as_bool(get(obj, "record", base.record), base.record),
+            record_dir=_as_str(get(obj, "record_dir", base.record_dir), base.record_dir),
+
+            stats_interval=_as_float(get(obj, "stats_interval", base.stats_interval), base.stats_interval),
+            state_interval=_as_float(get(obj, "state_interval", base.state_interval), base.state_interval),
+
+            no_engine=_as_bool(get(obj, "no_engine", base.no_engine), base.no_engine),
+            rules_path=_as_str(get(obj, "rules_path", base.rules_path), base.rules_path),
+            comm_throttle=_as_float(get(obj, "comm_throttle", base.comm_throttle), base.comm_throttle),
+
+            no_supervisor=_as_bool(get(obj, "no_supervisor", base.no_supervisor), base.no_supervisor),
         )
 
-    def override(
-        self,
-        udp_host: str | None = None,
-        udp_port: int | None = None,
-        packet_format: int | None = None,
-        game_year: int | None = None,
-        queue_maxsize: int | None = None,
-        stats_interval_s: float | None = None,
-        state_interval_s: float | None = None,
-        log_level: str | None = None,
-        record_enabled: bool | None = None,
-        record_dir: str | None = None,
-        replay_path: str | None = None,
-        replay_speed: float | None = None,
-        replay_no_sleep: bool | None = None,
-    ) -> "AppConfig":
-        return replace(
-            self,
-            udp_host=self.udp_host if udp_host is None else udp_host,
-            udp_port=self.udp_port if udp_port is None else udp_port,
-            packet_format=self.packet_format if packet_format is None else packet_format,
-            game_year=self.game_year if game_year is None else game_year,
-            queue_maxsize=self.queue_maxsize if queue_maxsize is None else queue_maxsize,
-            stats_interval_s=self.stats_interval_s if stats_interval_s is None else float(stats_interval_s),
-            state_interval_s=self.state_interval_s if state_interval_s is None else float(state_interval_s),
-            log_level=self.log_level if log_level is None else log_level,
-            record_enabled=self.record_enabled if record_enabled is None else bool(record_enabled),
-            record_dir=self.record_dir if record_dir is None else record_dir,
-            replay_path=self.replay_path if replay_path is None else replay_path,
-            replay_speed=self.replay_speed if replay_speed is None else float(replay_speed),
-            replay_no_sleep=self.replay_no_sleep if replay_no_sleep is None else bool(replay_no_sleep),
-        )
+        # saneamientos mínimos
+        if cfg.replay_speed <= 0:
+            cfg.replay_speed = 1.0
+        if cfg.packet_format <= 0:
+            cfg.packet_format = 2025
+
+        return cfg
