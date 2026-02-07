@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import struct
@@ -7,32 +7,6 @@ from typing import Optional, Tuple
 
 # F1 UDP header size (ya usado en dispatcher/protocol)
 PKT_HDR_SIZE = 29
-
-from dataclasses import dataclass
-
-@dataclass(slots=True)
-class PacketHeaderLite:
-    m_packetFormat: int
-    m_gameYear: int
-    m_gameMajorVersion: int
-    m_gameMinorVersion: int
-    m_packetVersion: int
-    m_packetId: int
-    m_sessionUID: int
-    m_sessionTime: float
-    m_frameIdentifier: int
-    m_playerCarIndex: int
-    m_secondaryPlayerCarIndex: int
-
-
-def decode_packet_header(payload: bytes) -> PacketHeaderLite | None:
-    if not payload or len(payload) < PKT_HDR_SIZE:
-        return None
-    try:
-        vals = PKT_HDR.unpack_from(payload, 0)
-    except Exception:
-        return None
-    return PacketHeaderLite(*vals)
 N_CARS = 22
 
 # Wheel order (documentado): 0 RL, 1 RR, 2 FL, 3 FR

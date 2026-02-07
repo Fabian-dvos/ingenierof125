@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+
+@dataclass(slots=True)
+class RuntimeStats:
+    started_at: float = field(default_factory=time.monotonic)
+
+    # sources
+    udp_rx: int = 0
+    udp_dropq: int = 0
+    replay_sent: int = 0
+
+    # dispatch
+    dispatched_in: int = 0
+    dropped_bad_header: int = 0
+    dropped_format_mismatch: int = 0
+    dropped_game_year_mismatch: int = 0
+    dropped_version_mismatch: int = 0
+
+    ids: Dict[int, int] = field(default_factory=dict)
+
+    # recording
+    rec_written: int = 0
+    rec_drop: int = 0
+
+    def uptime_s(self) -> float:
+        return max(0.0, time.monotonic() - self.started_at)
+
+    def format_line(self, *, state_line: str = "", qsize: int = 0, qmax: int = 0) -> str:
+        up = self.uptime_s()
+        ids_s = ""
+        if self.ids:
+            items = sorted(self.ids.items(), key=lambda kv: kv[0])
+            ids_s = ",".join(f"{k}:{v}" for k, v in items[:32])
+            if len(items) > 32:
+                ids_s += ",..."
+        return (
+            f"up={up:.1f}s "
+            f"udp_rx={self.udp_rx} udp_dropQ={self.udp_dropq} "
+            f"replay_sent={self.replay_sent} "
+            f"dispatched_in={self.dispatched_in} "
+            f"drop_bad_hdr={self.dropped_bad_header} "
+            f"drop_fmt={self.dropped_format_mismatch} "
+            f"drop_year={self.dropped_game_year_mismatch} "
+            f"drop_ver={self.dropped_version_mismatch} "
+            f"rec_ok={self.rec_written} rec_drop={self.rec_drop} "
+            f"q={qsize}/{qmax} "
+            f"ids=[{ids_s}] "
+            f"state={state_line}"
+        )
+
+
+class StatsReporter:
+    def __init__(self, stats: RuntimeStats, state_mgr, interval_s: float, queue: Optional[asyncio.Queue] = None) -> None:
+        self.stats = stats
+        self.state_mgr = state_mgr
+        self.interval_s = float(interval_s or 0.0)
+        self.queue = queue
+        self.log = logging.getLogger("ingenierof125.stats")
+
+    async def run(self, stop: asyncio.Event) -> None:
+        if self.interval_s <= 0:
+            return
+        while not stop.is_set():
+            try:
+                state_line = self.state_mgr.format_one_line()
+            except Exception:
+                state_line = "state=<error>"
+
+            qsize = 0
+            qmax = 0
+            if self.queue is not None:
+                try:
+                    qsize = int(self.queue.qsize())
+                    qmax = int(getattr(self.queue, "maxsize", 0) or 0)
+                except Exception:
+                    qsize = 0
+                    qmax = 0
+
+            self.log.info(self.stats.format_line(state_line=state_line, qsize=qsize, qmax=qmax))
+            await asyncio.sleep(self.interval_s)

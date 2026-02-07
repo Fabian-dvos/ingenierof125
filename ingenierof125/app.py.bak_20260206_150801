@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any, Optional, Tuple
+
+from ingenierof125.comms.logger_sink import LoggerComms
+from ingenierof125.core.config import AppConfig
+from ingenierof125.core.logging_setup import setup_logging
+from ingenierof125.core.stats import RuntimeStats, StatsReporter
+from ingenierof125.engine.engine import EngineerEngine
+from ingenierof125.ingest.recorder import PacketRecorder
+from ingenierof125.ingest.replay import PacketReplayer
+from ingenierof125.rules.load import default_rules_path, load_rules
+from ingenierof125.rules.model import RuleConfig
+from ingenierof125.state.manager import StateManager
+from ingenierof125.telemetry.dispatcher import PacketDispatcher
+from ingenierof125.telemetry.udp_listener import UdpListener
+
+
+def _parse_listen(s: str) -> Tuple[str, int]:
+    s = (s or "").strip()
+    if ":" not in s:
+        return (s or "0.0.0.0", 20777)
+    host, port_s = s.rsplit(":", 1)
+    host = host.strip() or "0.0.0.0"
+    try:
+        port = int(port_s)
+    except Exception:
+        port = 20777
+    if port <= 0:
+        port = 20777
+    return (host, port)
+
+
+async def run_app(args: Any) -> int:
+    # Normalizar args -> AppConfig
+    cfg = args if isinstance(args, AppConfig) else AppConfig.from_obj(args)
+    setup_logging(cfg)
+
+    log = logging.getLogger("ingenierof125")
+
+    # Stop event GLOBAL de la app (definir ANTES de usarlo)
+    stop_evt = asyncio.Event()
+
+    # Core state
+    stats = RuntimeStats()
+    state_manager = StateManager()
+
+    # Queues
+    queue_maxsize = int(getattr(cfg, "queue_maxsize", 2048) or 2048)
+    dispatch_maxsize = int(getattr(cfg, "dispatch_maxsize", queue_maxsize) or queue_maxsize)
+
+    raw_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_maxsize)
+    dispatch_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=dispatch_maxsize)
+
+    # Dispatcher (firma real: state_manager)
+    dispatcher = PacketDispatcher(
+        expected_packet_format=int(getattr(cfg, "packet_format", 2025) or 2025),
+        expected_game_year=int(getattr(cfg, "game_year", 25) or 25),
+        stats=stats,
+        state_manager=state_manager,
+    )
+
+    # Recorder (firma real)
+    record_enabled = bool(getattr(cfg, "record", False))
+    record_dir = str(getattr(cfg, "record_dir", "recordings") or "recordings")
+    recorder = PacketRecorder(out_dir=record_dir, enabled=record_enabled, queue_maxsize=queue_maxsize)
+
+    # Fanout raw -> recorder + dispatch
+    async def fanout_loop() -> None:
+        while not stop_evt.is_set():
+            data = await raw_queue.get()
+            recorder.try_enqueue(data)  # safe: si enabled=False, no hace nada relevante
+            await dispatch_queue.put(data)
+
+    # Stats reporter (firma real)
+    reporter_task: Optional[asyncio.Task] = None
+    stats_interval = float(getattr(cfg, "stats_interval", 0.0) or 0.0)
+    if stats_interval > 0:
+        reporter = StatsReporter(stats=stats, state_mgr=state_manager, interval_s=stats_interval, queue=dispatch_queue)
+        reporter_task = asyncio.create_task(reporter.run(stop_evt), name="stats_reporter")
+
+    # State snapshot (opcional)
+    snapshot_task: Optional[asyncio.Task] = None
+    state_interval = float(getattr(cfg, "state_interval", 0.0) or 0.0)
+    if state_interval > 0:
+        snap_log = logging.getLogger("ingenierof125.state_snapshot")
+
+        async def snapshot_loop() -> None:
+            while True:
+                try:
+                    await asyncio.wait_for(stop_evt.wait(), timeout=state_interval)
+                    break
+                except asyncio.TimeoutError:
+                    snap_log.info(state_manager.format_one_line())
+
+        snapshot_task = asyncio.create_task(snapshot_loop(), name="state_snapshot")
+
+    # Engine (opcional)
+    engine_task: Optional[asyncio.Task] = None
+    if not bool(getattr(cfg, "no_engine", False)):
+        try:
+            rules_path = str(getattr(cfg, "rules_path", "") or "") or default_rules_path()
+            rules_cfg = load_rules(rules_path)  # RulesConfig (dict-like)
+            comm_throttle = float(getattr(cfg, "comm_throttle", 0.0) or 0.0)
+            if comm_throttle > 0:
+                rules_cfg = rules_cfg.override(throttle_s=comm_throttle)
+
+            engine = EngineerEngine.create(RuleConfig(raw=rules_cfg), LoggerComms())
+
+            engine_tick_hz = float(getattr(args, "engine_tick_hz", 10.0) or 10.0)
+            if engine_tick_hz <= 0:
+                engine_tick_hz = 10.0
+            period = 1.0 / engine_tick_hz
+
+            async def engine_loop() -> None:
+                loop = asyncio.get_running_loop()
+                while not stop_evt.is_set():
+                    engine.tick(state_manager.state, loop.time())
+                    try:
+                        await asyncio.wait_for(stop_evt.wait(), timeout=period)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+            engine_task = asyncio.create_task(engine_loop(), name="engine")
+
+        except Exception:
+            log.exception("Engine init failed (continuing without engine)")
+
+    # Tasks principales
+    fanout_task = asyncio.create_task(fanout_loop(), name="fanout")
+    dispatcher_task = asyncio.create_task(dispatcher.run(dispatch_queue), name="dispatcher")
+    recorder_task = asyncio.create_task(recorder.run(), name="recorder")
+
+    # Source (replay o UDP) - firmas reales
+    replay_path = str(getattr(cfg, "replay", "") or "")
+    src_task: asyncio.Task
+    src_obj: Any
+
+    if replay_path:
+        speed = float(getattr(cfg, "replay_speed", 1.0) or 1.0)
+        no_sleep = bool(getattr(cfg, "replay_no_sleep", False))
+        src_obj = PacketReplayer(path=replay_path, speed=speed, no_sleep=no_sleep)
+        src_task = asyncio.create_task(src_obj.run(raw_queue), name="replay")
+    else:
+        host, port = _parse_listen(str(getattr(cfg, "listen", "0.0.0.0:20777") or "0.0.0.0:20777"))
+        src_obj = UdpListener(host=host, port=port, out_queue=raw_queue, drop_when_full=True, stats=stats)
+        src_task = asyncio.create_task(src_obj.run(), name="udp")
+
+    try:
+        # Replay termina solo; UDP queda corriendo hasta Ctrl+C
+        await src_task
+
+        # Si fue replay, dale un poco de tiempo a drenar colas
+        if replay_path:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 2.0
+            while (raw_queue.qsize() > 0 or dispatch_queue.qsize() > 0) and loop.time() < deadline:
+                await asyncio.sleep(0.05)
+
+    finally:
+        stop_evt.set()
+
+        # best-effort stops
+        try:
+            if hasattr(src_obj, "stop"):
+                src_obj.stop()
+        except Exception:
+            pass
+        try:
+            recorder.stop()
+        except Exception:
+            pass
+
+        # cancel tasks
+        for t in (fanout_task, dispatcher_task, recorder_task, reporter_task, snapshot_task, engine_task):
+            if t is not None:
+                t.cancel()
+
+        await asyncio.gather(
+            *(t for t in (fanout_task, dispatcher_task, recorder_task, reporter_task, snapshot_task, engine_task) if t is not None),
+            return_exceptions=True,
+        )
+
+    return 0

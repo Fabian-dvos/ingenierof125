@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -6,105 +6,142 @@ import os
 import struct
 import time
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Any
 
+from ingenierof125.core.stats import RuntimeStats
 
-MAGIC = b"INGREC1\0"  # 8 bytes
-VERSION = 1
-_HEADER = struct.Struct("<8sH")        # magic + u16 version
-_RECORD = struct.Struct("<QI")         # u64 ts_ns + u32 length
+log = logging.getLogger("ingenierof125.recorder")
+
+MAGIC = b"INGREC1\0"              # 8 bytes
+_HEADER = struct.Struct("<8sH")   # magic + u16 version
+_RECORD = struct.Struct("<QI")    # u64 ts_ns + u32 length
 
 
 @dataclass(slots=True)
 class RecorderStats:
-    written: int = 0
+    enqueued: int = 0
     dropped: int = 0
+    written: int = 0
+    last_path: str = ""
 
 
 class PacketRecorder:
+    """
+    Recorder compatible hacia atrás.
+
+    Soporta:
+      - queue_maxsize (nuevo)
+      - max_queue (viejo alias)
+      - stats=RuntimeStats (viejo) opcional
+    """
+
     def __init__(
         self,
         out_dir: str = "recordings",
         enabled: bool = False,
-        queue_maxsize: int = 4096,
+        queue_maxsize: int = 2048,
         flush_every: int = 64,
+        *,
+        max_queue: Optional[int] = None,          # alias viejo
+        stats: Optional[RuntimeStats] = None,     # opcional viejo
+        **_ignored: Any,                          # traga kwargs desconocidos
     ) -> None:
-        self._enabled = enabled
+        if max_queue is not None:
+            try:
+                queue_maxsize = int(max_queue)
+            except Exception:
+                pass
+
         self._out_dir = out_dir
+        self._enabled = bool(enabled)
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=int(queue_maxsize))
         self._flush_every = max(1, int(flush_every))
-        self._log = logging.getLogger("ingenierof125.recorder")
         self._stop = asyncio.Event()
+
         self.stats = RecorderStats()
-
-        self._queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue(maxsize=queue_maxsize)
-        self._file = None  # type: Optional[object]
-        self._path: str | None = None
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    @property
-    def path(self) -> str | None:
-        return self._path
+        self._rstats = stats  # RuntimeStats opcional
 
     def stop(self) -> None:
         self._stop.set()
 
-    def try_enqueue(self, payload: bytes, ts_ns: int | None = None) -> None:
+    def try_enqueue(self, payload: bytes) -> bool:
         if not self._enabled:
-            return
-        if ts_ns is None:
-            ts_ns = time.time_ns()
+            return False
         try:
-            self._queue.put_nowait((ts_ns, payload))
+            self._queue.put_nowait(payload)
+            self.stats.enqueued += 1
+            return True
         except asyncio.QueueFull:
             self.stats.dropped += 1
+            if self._rstats is not None:
+                self._rstats.rec_drop += 1
+            return False
 
-    def _open(self) -> None:
-        os.makedirs(self._out_dir, exist_ok=True)
-        name = datetime.now().strftime("%Y%m%d_%H%M%S") + "_f1udp.ingrec"
-        self._path = os.path.join(self._out_dir, name)
-        f = open(self._path, "wb", buffering=1024 * 1024)
-        f.write(_HEADER.pack(MAGIC, VERSION))
-        self._file = f
-        self._log.info("Recording to %s", self._path)
+    async def enqueue(self, payload: bytes) -> bool:
+        # Compat: algunos callers usan "await recorder.enqueue(...)"
+        return self.try_enqueue(payload)
 
-    def _close(self) -> None:
-        try:
-            if self._file:
-                self._file.flush()
-                self._file.close()
-        finally:
-            self._file = None
+    def _new_path(self) -> str:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        Path(self._out_dir).mkdir(parents=True, exist_ok=True)
+        return str(Path(self._out_dir) / f"{ts}_f1udp.ingrec")
 
-    async def run(self) -> None:
+    async def run(self, stop_evt: Optional[asyncio.Event] = None) -> None:
         if not self._enabled:
-            return
+            # Igual esperamos stop para no romper pipeline
+            while True:
+                if self._stop.is_set() or (stop_evt is not None and stop_evt.is_set()):
+                    return
+                await asyncio.sleep(0.2)
 
-        self._open()
-        assert self._file is not None
+        path = self._new_path()
+        self.stats.last_path = path
+        log.info("Recording to %s", path)
 
-        buffered = 0
+        f = open(path, "wb")
         try:
-            while not self._stop.is_set():
+            f.write(_HEADER.pack(MAGIC, 1))
+
+            buf: list[tuple[int, bytes]] = []
+
+            def flush() -> None:
+                if not buf:
+                    return
+                for ts_ns, payload in buf:
+                    f.write(_RECORD.pack(int(ts_ns), len(payload)))
+                    f.write(payload)
+
+                n = len(buf)
+                self.stats.written += n
+                if self._rstats is not None:
+                    self._rstats.rec_written += n
+
+                buf.clear()
+                f.flush()
+
+            while True:
+                if self._stop.is_set() or (stop_evt is not None and stop_evt.is_set()):
+                    flush()
+                    return
+
                 try:
-                    ts_ns, payload = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                    payload = await asyncio.wait_for(self._queue.get(), timeout=0.5)
                 except asyncio.TimeoutError:
+                    flush()
                     continue
 
-                if len(payload) > 0xFFFFFFFF:
-                    self.stats.dropped += 1
-                    continue
+                buf.append((time.time_ns(), payload))
+                if len(buf) >= self._flush_every:
+                    flush()
 
-                self._file.write(_RECORD.pack(ts_ns, len(payload)))
-                self._file.write(payload)
-                self.stats.written += 1
-                buffered += 1
-
-                if buffered >= self._flush_every:
-                    self._file.flush()
-                    buffered = 0
         finally:
-            self._close()
+            try:
+                f.flush()
+            except Exception:
+                pass
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+            f.close()

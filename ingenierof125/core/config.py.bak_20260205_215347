@@ -1,7 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any
 
 
 def _as_int(v: Any, default: int) -> int:
@@ -34,35 +34,14 @@ def _as_str(v: Any, default: str) -> str:
         return default
 
 
-def _parse_listen(s: str) -> Tuple[str, int]:
-    s = (s or "").strip()
-    if not s:
-        return ("0.0.0.0", 20777)
-    if ":" not in s:
-        return (s, 20777)
-    host, port_s = s.rsplit(":", 1)
-    host = host.strip() or "0.0.0.0"
-    try:
-        port = int(port_s)
-    except Exception:
-        port = 20777
-    if port <= 0:
-        port = 20777
-    return (host, port)
-
-
 @dataclass(slots=True)
 class AppConfig:
     # logging
     log_level: str = "INFO"
     log_dir: str = "logs"
 
-    # expected UDP header defaults (F1 25 / 2025)
-    packet_format: int = 2025
-    game_year: int = 25
-    game_major: int = 1
-    game_minor: int = 0
-    packet_version: int = 1
+    # protocol expectations
+    packet_format: int = 2025  # F1 25 UDP "format" (m_packetFormat)
 
     # mode
     listen: str = "0.0.0.0:20777"
@@ -90,46 +69,20 @@ class AppConfig:
     # supervisor
     no_supervisor: bool = False
 
-    # --- Aliases compatibles (para evitar futuros “AttributeError”) ---
-    @property
-    def record_enabled(self) -> bool:
-        return bool(self.record)
-
-    @property
-    def replay_path(self) -> str:
-        return self.replay
-
-    @property
-    def stats_interval_s(self) -> float:
-        return float(self.stats_interval)
-
-    @property
-    def state_interval_s(self) -> float:
-        return float(self.state_interval)
-
-    @property
-    def udp_host(self) -> str:
-        return _parse_listen(self.listen)[0]
-
-    @property
-    def udp_port(self) -> int:
-        return _parse_listen(self.listen)[1]
-
     @classmethod
     def from_obj(cls, obj: Any) -> "AppConfig":
-        # IMPORTANTE: con dataclass(slots=True) no usar cls.campo como default (member_descriptor)
-        base = cls()
-        get = getattr
+        """
+        Construye config estable desde argparse.Namespace o cualquier objeto con atributos.
+        IMPORTANTE: con dataclass(slots=True) NO usar cls.campo como default (es member_descriptor).
+        """
+        base = cls()  # << defaults REALES
 
+        get = getattr
         cfg = cls(
             log_level=_as_str(get(obj, "log_level", base.log_level), base.log_level),
             log_dir=_as_str(get(obj, "log_dir", base.log_dir), base.log_dir),
 
             packet_format=_as_int(get(obj, "packet_format", base.packet_format), base.packet_format),
-            game_year=_as_int(get(obj, "game_year", base.game_year), base.game_year),
-            game_major=_as_int(get(obj, "game_major", base.game_major), base.game_major),
-            game_minor=_as_int(get(obj, "game_minor", base.game_minor), base.game_minor),
-            packet_version=_as_int(get(obj, "packet_version", base.packet_version), base.packet_version),
 
             listen=_as_str(get(obj, "listen", base.listen), base.listen),
             replay=_as_str(get(obj, "replay", base.replay), base.replay),
@@ -152,6 +105,10 @@ class AppConfig:
             no_supervisor=_as_bool(get(obj, "no_supervisor", base.no_supervisor), base.no_supervisor),
         )
 
+        # saneamientos mínimos
         if cfg.replay_speed <= 0:
             cfg.replay_speed = 1.0
+        if cfg.packet_format <= 0:
+            cfg.packet_format = 2025
+
         return cfg

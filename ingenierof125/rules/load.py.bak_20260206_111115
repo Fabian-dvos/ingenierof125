@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 from ingenierof125.rules.model import RulesConfig
 
 
 def default_rules_path() -> str:
+    """
+    Devuelve un path por defecto a rules/v1.json.
+    Prioridad:
+      1) <repo_root>/rules/v1.json
+      2) <package>/ingenierof125/rules/v1.json
+    """
     here = Path(__file__).resolve()
     repo_root = here.parents[3] if len(here.parents) >= 4 else here.parents[2]
 
@@ -18,19 +24,20 @@ def default_rules_path() -> str:
         return str(cand_repo)
     if cand_pkg.exists():
         return str(cand_pkg)
+
     return str(cand_repo)
 
 
 def load_rules(path: str) -> RulesConfig:
     """
     Carga reglas desde JSON.
-    Tolerante a UTF-8 BOM (PowerShell 5.1 con -Encoding utf8 suele meter BOM).
-    Devuelve RulesConfig (dict-like + override + helpers).
+    Tolerante a UTF-8 BOM.
+    Devuelve RulesConfig (con override y comportamiento tipo dict).
     """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Rules file not found: {p}")
 
-    text = p.read_text(encoding="utf-8-sig")
-    raw: Any = json.loads(text)
-    return RulesConfig(raw)
+    text = p.read_text(encoding="utf-8-sig")  # BOM-safe
+    data: Dict[str, Any] = json.loads(text)
+    return RulesConfig(data)

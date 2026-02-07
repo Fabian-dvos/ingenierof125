@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+
+def load_rules(path: str) -> Dict[str, Any]:
+    """
+    Carga reglas desde JSON.
+    Tolerante a UTF-8 BOM (muy común si el archivo fue escrito por PowerShell 5.1 con -Encoding utf8).
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Rules file not found: {p}")
+
+    text = p.read_text(encoding="utf-8-sig")  # <-- BOM-safe
+    return json.loads(text)

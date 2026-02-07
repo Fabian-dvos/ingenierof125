@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Optional, Tuple
+
+from ingenierof125.comms.logger_sink import LoggerComms
+from ingenierof125.core.config import AppConfig
+from ingenierof125.core.logging_setup import setup_logging
+from ingenierof125.core.stats import Stats
+from ingenierof125.engine.engine import EngineerEngine
+from ingenierof125.ingest.recorder import PacketRecorder
+from ingenierof125.ingest.replay import PacketReplayer
+from ingenierof125.rules.load import default_rules_path, load_rules
+from ingenierof125.rules.model import RuleConfig
+from ingenierof125.state.manager import StateManager
+from ingenierof125.telemetry.dispatcher import PacketDispatcher
+from ingenierof125.telemetry.udp_listener import UdpListener
+
+
+def parse_listen(s: str) -> Tuple[str, int]:
+    s = (s or "").strip()
+    if ":" not in s:
+        return (s or "0.0.0.0", 20777)
+    host, port_s = s.rsplit(":", 1)
+    host = host.strip() or "0.0.0.0"
+    try:
+        port = int(port_s)
+    except Exception:
+        port = 20777
+    return (host, port)
+
+
+async def run_app(args) -> int:
+    # Normalizar args->AppConfig SIEMPRE
+    cfg = AppConfig.from_obj(args)
+    setup_logging(cfg)
+
+    log = logging.getLogger("ingenierof125")
+    stats = Stats()
+
+    raw_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=cfg.queue_maxsize)
+    stop_evt = asyncio.Event()
+
+    state_mgr = StateManager()
+
+    dispatcher = PacketDispatcher(
+        state_mgr=state_mgr,
+        raw_queue=raw_queue,
+        stats=stats,
+        stop_evt=stop_evt,
+        expected_packet_format=cfg.packet_format,
+        expected_game_year=cfg.game_year,
+    )
+
+    # Recorder
+    recorder = PacketRecorder(out_dir=cfg.record_dir, enabled=cfg.record)
+    recorder_task = asyncio.create_task(recorder.run(stop_evt), name="recorder")
+
+    # Stats reporter
+    async def stats_loop() -> None:
+        if cfg.stats_interval <= 0:
+            return
+        while not stop_evt.is_set():
+            log.info(stats.format())
+            await asyncio.sleep(cfg.stats_interval)
+
+    stats_task = asyncio.create_task(stats_loop(), name="stats")
+
+    # State snapshot
+    snap_log = logging.getLogger("ingenierof125.state_snapshot")
+
+    async def snapshot_loop() -> None:
+        if cfg.state_interval <= 0:
+            return
+        while not stop_evt.is_set():
+            snap_log.info(state_mgr.format_line())
+            await asyncio.sleep(cfg.state_interval)
+
+    snapshot_task = asyncio.create_task(snapshot_loop(), name="snapshot")
+
+    # Engine (eventos)
+    engine: Optional[EngineerEngine] = None
+
+    if not cfg.no_engine:
+        try:
+            rules_path = cfg.rules_path or default_rules_path()
+            rules_cfg = RuleConfig(raw=load_rules(rules_path))
+
+            if cfg.comm_throttle > 0:
+                # override devuelve RulesConfig; volvemos a RuleConfig para el motor
+                rules_cfg = RuleConfig(raw=rules_cfg.override(throttle_s=cfg.comm_throttle))
+
+            comms = LoggerComms()
+            engine = EngineerEngine(rules_cfg, comms)
+        except Exception:
+            log.exception("Engine init failed (continuing without engine)")
+            engine = None
+
+    async def engine_loop() -> None:
+        if engine is None:
+            return
+        loop = asyncio.get_running_loop()
+        while not stop_evt.is_set():
+            now_s = loop.time()
+            st = state_mgr.state
+            session_t = float(state_mgr.latest_session_time or 0.0)
+            engine.tick(now_s, st, session_t)
+            await asyncio.sleep(0.10)
+
+    engine_task = asyncio.create_task(engine_loop(), name="engine")
+
+    # Source: replay o UDP
+    if cfg.replay:
+        src = PacketReplayer(
+            path=cfg.replay,
+            out=raw_queue,
+            stats=stats,
+            stop_evt=stop_evt,
+            speed=cfg.replay_speed,
+            no_sleep=cfg.replay_no_sleep,
+        )
+        src_task = asyncio.create_task(src.run(), name="replay")
+    else:
+        host, port = parse_listen(cfg.listen)
+        src = UdpListener(host=host, port=port, out=raw_queue, stats=stats, stop_evt=stop_evt)
+        src_task = asyncio.create_task(src.run(), name="udp")
+
+    disp_task = asyncio.create_task(dispatcher.run(), name="dispatcher")
+
+    try:
+        await asyncio.gather(src_task, disp_task)
+    finally:
+        stop_evt.set()
+        # apagar todo
+        for t in (engine_task, snapshot_task, stats_task, recorder_task):
+            t.cancel()
+        await asyncio.gather(engine_task, snapshot_task, stats_task, recorder_task, return_exceptions=True)
+
+    return 0
