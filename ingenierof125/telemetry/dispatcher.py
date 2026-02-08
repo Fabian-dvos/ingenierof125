@@ -2,56 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
 
-from ingenierof125.telemetry.protocol import PacketHeader
+from ingenierof125.core.stats import RuntimeStats
 from ingenierof125.state.manager import StateManager
-
-
-log = logging.getLogger("ingenierof125.dispatcher")
-
-
-def _inc(stats: Any, *names: str, delta: int = 1) -> None:
-    """Incrementa el primer campo existente en stats (compat multi-version)."""
-    if stats is None:
-        return
-    for n in names:
-        try:
-            cur = getattr(stats, n)
-        except Exception:
-            continue
-        try:
-            setattr(stats, n, int(cur) + int(delta))
-            return
-        except Exception:
-            pass
-    # si ninguno existe, no hacemos nada (no queremos crashear)
-
-
-def _get_dict(stats: Any, *names: str) -> dict | None:
-    if stats is None:
-        return None
-    for n in names:
-        try:
-            d = getattr(stats, n)
-        except Exception:
-            continue
-        if isinstance(d, dict):
-            return d
-    return None
-
-
-def _set_if_exists(stats: Any, name: str, value: Any) -> None:
-    if stats is None:
-        return
-    try:
-        getattr(stats, name)
-    except Exception:
-        return
-    try:
-        setattr(stats, name, value)
-    except Exception:
-        return
+from ingenierof125.telemetry.protocol import PacketHeader
 
 
 class PacketDispatcher:
@@ -59,12 +13,13 @@ class PacketDispatcher:
         self,
         expected_packet_format: int,
         expected_game_year: int,
-        stats: Any = None,
+        stats: RuntimeStats | None = None,
         state_manager: StateManager | None = None,
         *,
         strict_format: bool = False,
         strict_game_year: bool = False,
     ) -> None:
+        self._log = logging.getLogger("ingenierof125.dispatcher")
         self._stop = asyncio.Event()
 
         self._expected_packet_format = int(expected_packet_format)
@@ -76,65 +31,71 @@ class PacketDispatcher:
         self._warned_format = False
         self._warned_year = False
 
-        self._stats = stats
+        self._stats = stats or RuntimeStats()
         self._state = state_manager
 
     def stop(self) -> None:
         self._stop.set()
 
+    def _touch_ids(self, packet_id: int) -> None:
+        # RuntimeStats.ids hoy es list[int]. Si mañana pasa a dict, también banca.
+        try:
+            ids = self._stats.ids
+        except Exception:
+            return
+
+        if isinstance(ids, list):
+            if packet_id not in ids:
+                ids.append(packet_id)
+                # mantenemos un buffer chico (debug)
+                if len(ids) > 24:
+                    del ids[: len(ids) - 24]
+        elif isinstance(ids, dict):
+            ids[packet_id] = int(ids.get(packet_id, 0)) + 1
+
     async def run(self, in_queue: "asyncio.Queue[bytes]") -> None:
-        log.info("Dispatcher running")
+        self._log.info("Dispatcher running")
         while not self._stop.is_set():
             try:
                 data = await asyncio.wait_for(in_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
 
-            _inc(self._stats, "dispatched_in")
+            self._stats.dispatched_in += 1
 
             hdr = PacketHeader.try_parse(data)
             if hdr is None:
-                _inc(self._stats, "dropped_bad_header", "drop_bad_hdr")
+                self._stats.drop_bad_hdr += 1
                 continue
 
-            # checks packet_format
-            if int(hdr.packet_format) != self._expected_packet_format:
+            if hdr.packet_format != self._expected_packet_format:
                 if self._strict_format:
-                    _inc(self._stats, "dropped_format", "dropped_format_mismatch", "drop_fmt")
+                    self._stats.drop_fmt += 1
                     continue
                 if not self._warned_format:
                     self._warned_format = True
-                    log.warning(
-                        "packet_format mismatch (got=%s expected=%s) strict_format=False -> ACCEPTING",
+                    self._log.warning(
+                        "packet_format mismatch (got=%s expected=%s) but strict_format=False -> ACCEPTING",
                         hdr.packet_format,
                         self._expected_packet_format,
                     )
 
-            # checks game_year
-            if int(hdr.game_year) != self._expected_game_year:
+            if hdr.game_year != self._expected_game_year:
                 if self._strict_game_year:
-                    _inc(self._stats, "dropped_game_year", "dropped_game_year_mismatch", "drop_year")
+                    self._stats.drop_year += 1
                     continue
                 if not self._warned_year:
                     self._warned_year = True
-                    log.warning(
-                        "game_year mismatch (got=%s expected=%s) strict_game_year=False -> ACCEPTING",
+                    self._log.warning(
+                        "game_year mismatch (got=%s expected=%s) but strict_game_year=False -> ACCEPTING",
                         hdr.game_year,
                         self._expected_game_year,
                     )
 
-            # ids counter (compat: ids o by_packet_id)
-            d = _get_dict(self._stats, "ids", "by_packet_id")
-            if d is not None:
-                pid = int(hdr.packet_id)
-                d[pid] = int(d.get(pid, 0)) + 1
+            # debug ids
+            self._touch_ids(int(hdr.packet_id))
 
-            # opcionales (si existen en stats)
-            _set_if_exists(self._stats, "last_packet_id", int(hdr.packet_id))
-            _set_if_exists(self._stats, "last_frame", int(hdr.frame_identifier))
-            _set_if_exists(self._stats, "last_session_uid", int(hdr.session_uid))
-
-            # state update
+            # Actualiza estado normalizado
             if self._state is not None:
                 try:
                     self._state.apply_packet(
@@ -144,6 +105,6 @@ class PacketDispatcher:
                         player_index=int(hdr.player_car_index),
                     )
                 except Exception:
-                    _inc(self._stats, "decode_errors", "dec_errors")
-                    if log.isEnabledFor(logging.DEBUG):
-                        log.exception("apply_packet failed")
+                    self._stats.dec_err += 1
+                    if self._log.isEnabledFor(logging.DEBUG):
+                        self._log.exception("apply_packet failed")

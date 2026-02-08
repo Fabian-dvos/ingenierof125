@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+from ingenierof125.state.manager import StateManager
+
+log = logging.getLogger("ingenierof125.stats")
+
+
+@dataclass(slots=True)
+class RuntimeStats:
+    started_ts: float = field(default_factory=time.time)
+
+    udp_rx: int = 0
+    udp_dropq: int = 0
+
+    replay_sent: int = 0
+    dispatched_in: int = 0
+
+    drop_bad_hdr: int = 0
+    drop_fmt: int = 0
+    drop_year: int = 0
+    drop_ver: int = 0
+
+    rec_written: int = 0
+    rec_drop: int = 0
+
+    ids: list[int] = field(default_factory=list)
+    dec_err: int = 0
+    player_car_index: int = 0
+
+    @property
+    def uptime_s(self) -> float:
+        return time.time() - self.started_ts
+
+    # -----------------------
+    # Compat aliases (viejo -> nuevo)
+    # -----------------------
+    @property
+    def udp_received(self) -> int:
+        return self.udp_rx
+
+    @udp_received.setter
+    def udp_received(self, v: int) -> None:
+        self.udp_rx = int(v)
+
+    @property
+    def udp_dropped_queue(self) -> int:
+        return self.udp_dropq
+
+    @udp_dropped_queue.setter
+    def udp_dropped_queue(self, v: int) -> None:
+        self.udp_dropq = int(v)
+
+    def format(self, state_line: str, stale_line: str) -> str:
+        # Mantener el formato que venías viendo en logs
+        return (
+            f"up={self.uptime_s:.1f}s "
+            f"udp_rx={self.udp_rx} udp_dropQ={self.udp_dropq} "
+            f"replay_sent={self.replay_sent} dispatched_in={self.dispatched_in} "
+            f"drop_bad_hdr={self.drop_bad_hdr} drop_fmt={self.drop_fmt} drop_year={self.drop_year} drop_ver={self.drop_ver} "
+            f"rec_ok={self.rec_written} rec_drop={self.rec_drop} "
+            f"q=? ids={self.ids} "
+            f"state={state_line} | {stale_line}"
+        )
+
+
+class StatsReporter:
+    def __init__(
+        self,
+        *,
+        stats: RuntimeStats,
+        state_mgr: StateManager,
+        interval_s: float = 1.0,
+        queue: Optional[asyncio.Queue[bytes]] = None,
+    ) -> None:
+        self.stats = stats
+        self.state_mgr = state_mgr
+        self.interval_s = max(0.1, float(interval_s))
+        self.queue = queue
+
+    async def run(self, stop_evt: asyncio.Event) -> None:
+        while not stop_evt.is_set():
+            try:
+                state_line = self.state_mgr.format_one_line()
+            except Exception:
+                state_line = "state=<?>"
+            try:
+                st = self.state_mgr.stale_flags()
+                stale_line = f"stale(session={st.session} lap={st.lap} status={st.status} telem={st.telemetry} dmg={st.damage})"
+            except Exception:
+                stale_line = "stale(?)"
+
+            # qsize si hay queue
+            if self.queue is not None:
+                try:
+                    q = self.queue.qsize()
+                    maxq = getattr(self.queue, "_maxsize", 0) or 0
+                    q_str = f"q={q}/{maxq}"
+                except Exception:
+                    q_str = "q=?"
+            else:
+                q_str = "q=?"
+
+            msg = (
+                f"up={self.stats.uptime_s:.1f}s "
+                f"udp_rx={self.stats.udp_rx} udp_dropQ={self.stats.udp_dropq} "
+                f"replay_sent={self.stats.replay_sent} dispatched_in={self.stats.dispatched_in} "
+                f"drop_bad_hdr={self.stats.drop_bad_hdr} drop_fmt={self.stats.drop_fmt} drop_year={self.stats.drop_year} drop_ver={self.stats.drop_ver} "
+                f"rec_ok={self.stats.rec_written} rec_drop={self.stats.rec_drop} "
+                f"{q_str} ids={self.stats.ids} "
+                f"state={state_line} | {stale_line} | "
+                f"t={self.state_mgr.state.latest_session_time:.3f} player={self.state_mgr.state.player_index} decErr={self.state_mgr.state.decode_errors}"
+            )
+
+            log.info(msg)
+            try:
+                await asyncio.wait_for(stop_evt.wait(), timeout=self.interval_s)
+            except asyncio.TimeoutError:
+                pass

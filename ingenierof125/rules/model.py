@@ -1,53 +1,77 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator, Mapping, Optional
+from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 
-class RulesConfig(Mapping[str, Any]):
+@dataclass(frozen=True, slots=True)
+class RuleConfig:
+    """Config final para el motor.
+
+    Nota: el motor necesita valores materializados (throttle/cooldowns/thresholds).
     """
-    Wrapper dict-like que sale de load_rules().
-    Mantiene compatibilidad con tests y lectura flexible.
-    """
 
-    def __init__(self, raw: Optional[Mapping[str, Any]] = None) -> None:
-        self.raw: Dict[str, Any] = dict(raw or {})
+    version: str = "v1"
+    comms_throttle_s: float = 12.0
+    event_cooldown_s: Mapping[str, float] = field(default_factory=dict)
+    thresholds: Mapping[str, float] = field(default_factory=dict)
 
-    def __getitem__(self, key: str) -> Any:
-        return self.raw[key]
+    raw: Mapping[str, Any] = field(default_factory=dict)
 
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.raw)
+    def __post_init__(self) -> None:
+        raw = self.raw or {}
+        if not raw:
+            return
 
-    def __len__(self) -> int:
-        return len(self.raw)
+        # version
+        if self.version == "v1" and "version" in raw:
+            try:
+                object.__setattr__(self, "version", str(raw.get("version") or "v1"))
+            except Exception:
+                pass
 
-    @property
-    def version(self) -> str:
-        return str(self.raw.get("version", "v1"))
+        # comms throttle: nuevo y legado
+        if self.comms_throttle_s == 12.0:
+            try:
+                comms = raw.get("comms") or {}
+                v = raw.get("comms_throttle_s", None)
+                if v is None:
+                    v = raw.get("throttle_s", None)
+                if v is None:
+                    v = comms.get("throttle_s", None)
+                if v is None:
+                    v = comms.get("throttle_seconds", None)
+                if v is not None:
+                    object.__setattr__(self, "comms_throttle_s", float(v))
+            except Exception:
+                pass
 
-    @property
-    def comms_throttle_s(self) -> float:
-        v = self.raw.get("comms_throttle_s", self.raw.get("throttle_s", 0.0))
+        # cooldowns: 'event_cooldown_s' (nuevo) o 'cooldowns' (legado)
+        if not self.event_cooldown_s:
+            try:
+                cd = raw.get("event_cooldown_s") or raw.get("cooldowns") or {}
+                object.__setattr__(self, "event_cooldown_s", dict(cd))
+            except Exception:
+                pass
+
+        # thresholds
+        if not self.thresholds:
+            try:
+                th = raw.get("thresholds") or {}
+                object.__setattr__(self, "thresholds", dict(th))
+            except Exception:
+                pass
+
+        # aliases (legado -> nuevo)
         try:
-            return float(v or 0.0)
+            th = dict(self.thresholds or {})
+            if "wing_damage_warn_pct" not in th and "wing_damage_warn" in th:
+                th["wing_damage_warn_pct"] = float(th["wing_damage_warn"])
+            if "wing_damage_critical_pct" not in th and "wing_damage_critical" in th:
+                th["wing_damage_critical_pct"] = float(th["wing_damage_critical"])
+            object.__setattr__(self, "thresholds", th)
         except Exception:
-            return 0.0
-
-    @property
-    def event_cooldown_s(self) -> Dict[str, float]:
-        cd = self.raw.get("event_cooldown_s", {}) or {}
-        return dict(cd)
-
-    @property
-    def thresholds(self) -> Dict[str, Any]:
-        th = self.raw.get("thresholds", {}) or {}
-        return dict(th)
-
-    def threshold(self, key: str, default: float) -> float:
-        try:
-            return float(self.thresholds.get(key, default))
-        except Exception:
-            return float(default)
+            pass
 
     def cooldown(self, key: str, default: float) -> float:
         try:
@@ -55,48 +79,78 @@ class RulesConfig(Mapping[str, Any]):
         except Exception:
             return float(default)
 
-    def override(self, **kwargs: Any) -> "RulesConfig":
-        data = dict(self.raw)
-        for k, v in kwargs.items():
-            if k in ("throttle_s", "comms_throttle_s"):
-                data["comms_throttle_s"] = float(v)
-            else:
-                data[k] = v
-        return type(self)(data)
+    def threshold(self, key: str, default: float) -> float:
+        if key not in self.thresholds:
+            alias = {
+                "wing_damage_warn_pct": "wing_damage_warn",
+                "wing_damage_critical_pct": "wing_damage_critical",
+            }
+            if key in alias and alias[key] in self.thresholds:
+                key = alias[key]
+
+        try:
+            return float(self.thresholds.get(key, default))
+        except Exception:
+            return float(default)
 
 
-class RuleConfig(RulesConfig):
-    """
-    Objeto que espera el motor.
-    Permite construcción directa (tests) y conserva el formato dict-like.
-    """
+@dataclass(frozen=True, slots=True)
+class RulesConfig:
+    version: str
+    raw: Mapping[str, Any]
 
-    def __init__(
-        self,
-        *,
-        version: Optional[str] = None,
-        comms_throttle_s: Optional[float] = None,
-        event_cooldown_s: Optional[Mapping[str, float]] = None,
-        thresholds: Optional[Mapping[str, Any]] = None,
-        raw: Optional[Mapping[str, Any]] = None,
-        **extra: Any,
-    ) -> None:
-        data = dict(raw or {})
-        if version is not None:
-            data["version"] = version
-        else:
-            data.setdefault("version", "v1")
+    @staticmethod
+    def from_mapping(raw: Mapping[str, Any]) -> "RulesConfig":
+        v = str(raw.get("version", "v1"))
+        return RulesConfig(version=v, raw=raw)
 
-        if comms_throttle_s is not None:
-            data["comms_throttle_s"] = float(comms_throttle_s)
+    def override(self, *, throttle_s: float | None = None) -> "RulesConfig":
+        new = dict(self.raw)
 
-        if event_cooldown_s is not None:
-            data["event_cooldown_s"] = dict(event_cooldown_s)
+        if throttle_s is not None:
+            # nuevo
+            new["comms_throttle_s"] = float(throttle_s)
+            # legado
+            comms = dict(new.get("comms") or {})
+            comms["throttle_seconds"] = float(throttle_s)
+            comms["throttle_s"] = float(throttle_s)
+            new["comms"] = comms
 
-        if thresholds is not None:
-            data["thresholds"] = dict(thresholds)
+        return RulesConfig(version=self.version, raw=new)
 
-        if extra:
-            data.update(extra)
+    @property
+    def comms_throttle_s(self) -> float:
+        if "comms_throttle_s" in self.raw:
+            return float(self.raw.get("comms_throttle_s", 12.0))
 
-        super().__init__(data)
+        comms = self.raw.get("comms") or {}
+        if "throttle_s" in comms:
+            return float(comms.get("throttle_s", 12.0))
+        if "throttle_seconds" in comms:
+            return float(comms.get("throttle_seconds", 12.0))
+
+        return float(self.raw.get("throttle_s", 12.0))
+
+    @property
+    def cooldowns(self) -> Mapping[str, float]:
+        cd = self.raw.get("event_cooldown_s")
+        if isinstance(cd, dict):
+            return cd
+        cd = self.raw.get("cooldowns")
+        if isinstance(cd, dict):
+            return cd
+        return {}
+
+    @property
+    def thresholds(self) -> Mapping[str, float]:
+        thr = self.raw.get("thresholds")
+        return thr if isinstance(thr, dict) else {}
+
+    def as_rule_config(self) -> RuleConfig:
+        return RuleConfig(
+            version=self.version,
+            comms_throttle_s=self.comms_throttle_s,
+            event_cooldown_s=dict(self.cooldowns),
+            thresholds=dict(self.thresholds),
+            raw=self.raw,
+        )

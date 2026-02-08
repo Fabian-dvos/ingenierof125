@@ -42,7 +42,7 @@ async def run_app(args: Any) -> int:
     setup_logging(cfg)
     log = logging.getLogger("ingenierof125")
 
-    # Config (robusto: por si algÃºn campo falta)
+    # Config (robusto: por si algún campo falta)
     listen = str(_get(cfg, "listen", "0.0.0.0:20777") or "0.0.0.0:20777")
     host, port = _parse_listen(listen)
 
@@ -124,7 +124,7 @@ async def run_app(args: Any) -> int:
             if comm_throttle > 0 and hasattr(rules, "override"):
                 rules = rules.override(throttle_s=comm_throttle)
 
-            engine = EngineerEngine.create(rules.as_rule_config(), LoggerComms())
+            engine = EngineerEngine.create(RuleConfig(raw=rules), LoggerComms())
 
             async def _engine_loop() -> None:
                 loop = asyncio.get_running_loop()

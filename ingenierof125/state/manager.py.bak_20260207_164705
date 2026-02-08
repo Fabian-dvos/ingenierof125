@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import math
@@ -54,12 +54,14 @@ class StateManager:
         return isinstance(t, float) and (not math.isnan(t)) and (not math.isinf(t)) and t >= 0.0
 
     def apply_packet(self, packet_id: int, payload: bytes, session_time: float, player_index: int) -> None:
+        # last-known-good player index
         if 0 <= player_index < 22:
             self._state.player_index = int(player_index)
 
         if self._good_t(session_time):
             self._update_latest_t(session_time)
         else:
+            # sin tiempo consistente, no tocamos TTLs
             session_time = self._state.latest_session_time
 
         idx = self._state.player_index
@@ -119,15 +121,11 @@ class StateManager:
             damage=stale(self._state.damage.t, self._ttls.damage, self._state.damage.ok),
         )
 
-    @staticmethod
-    def _sc_text(code: int) -> str:
-        # (mapping típico Codemasters) 0=None 1=SC 2=VSC 3=Formation 4=Ending
-        return {0: "NONE", 1: "SC", 2: "VSC", 3: "FORM", 4: "ENDING"}.get(int(code), f"SC?{int(code)}")
-
-    def format_brief(self) -> str:
-        """Línea sin stale/t (para StatsReporter)."""
+    def format_one_line(self) -> str:
         s = self._state
-        parts: list[str] = []
+        st = self.stale_flags()
+
+        parts = []
 
         if s.lap.value:
             lap = s.lap.value
@@ -137,10 +135,7 @@ class StateManager:
 
         if s.status.value:
             ss = s.status.value
-            parts.append(
-                f"fuel={ss.fuel_in_tank:.2f} remLaps={ss.fuel_remaining_laps:.2f} "
-                f"tyre={compound_name(ss.actual_compound, ss.visual_compound)} age={ss.tyre_age_laps} DRSok={ss.drs_allowed}"
-            )
+            parts.append(f"fuel={ss.fuel_in_tank:.2f} remLaps={ss.fuel_remaining_laps:.2f} tyre={compound_name(ss.actual_compound, ss.visual_compound)} age={ss.tyre_age_laps} DRSok={ss.drs_allowed}")
         else:
             parts.append("fuel=--")
 
@@ -157,19 +152,8 @@ class StateManager:
         else:
             parts.append("dmg=--")
 
-        # SC/VSC (sale de SessionLite)
-        if s.session.value is not None:
-            sc_code = getattr(s.session.value, "safety_car_status", 0)
-            parts.append(f"SC={self._sc_text(sc_code)}")
-
-        return " | ".join(parts)
-
-    def format_one_line(self) -> str:
-        """Línea completa (para state_snapshot)."""
-        s = self._state
-        st = self.stale_flags()
-
-        parts = [self.format_brief()]
-        parts.append(f"stale(session={st.session} lap={st.lap} status={st.status} telem={st.telemetry} dmg={st.damage})")
+        stale_str = f"stale(session={st.session} lap={st.lap} status={st.status} telem={st.telemetry} dmg={st.damage})"
+        parts.append(stale_str)
         parts.append(f"t={s.latest_session_time:.3f} player={s.player_index} decErr={s.decode_errors}")
+
         return " | ".join(parts)

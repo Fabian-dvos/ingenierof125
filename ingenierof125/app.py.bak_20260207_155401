@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Optional, Tuple
 
@@ -37,18 +38,23 @@ def _get(obj: Any, name: str, default: Any) -> Any:
     return getattr(obj, name, default)
 
 
+def _safe_kwargs(fn, **kwargs: Any) -> dict[str, Any]:
+    """Filtra kwargs según la firma real de `fn` (evita TypeError por cambios de API)."""
+    try:
+        sig = inspect.signature(fn)
+        accepted = set(sig.parameters.keys())
+    except Exception:
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in accepted}
+
+
 async def run_app(args: Any) -> int:
     cfg = args if isinstance(args, AppConfig) else AppConfig.from_obj(args)
     setup_logging(cfg)
     log = logging.getLogger("ingenierof125")
 
-    # Config (robusto: por si algÃºn campo falta)
-    listen = str(_get(cfg, "listen", "0.0.0.0:20777") or "0.0.0.0:20777")
-    host, port = _parse_listen(listen)
-
-    replay_path = str(_get(cfg, "replay", "") or "")
-    replay_speed = float(_get(cfg, "replay_speed", 1.0) or 1.0)
-    replay_no_sleep = bool(_get(cfg, "replay_no_sleep", False))
+    queue_maxsize = int(_get(cfg, "queue_maxsize", 2048) or 2048)
+    dispatch_maxsize = int(_get(cfg, "dispatch_maxsize", queue_maxsize) or queue_maxsize)
 
     packet_format = int(_get(cfg, "packet_format", 2025) or 2025)
     game_year = int(_get(cfg, "game_year", 25) or 25)
@@ -56,7 +62,12 @@ async def run_app(args: Any) -> int:
     strict_format = bool(_get(cfg, "strict_format", False))
     strict_game_year = bool(_get(cfg, "strict_game_year", False))
 
-    queue_maxsize = int(_get(cfg, "queue_maxsize", 2048) or 2048)
+    listen = str(_get(cfg, "listen", "0.0.0.0:20777") or "0.0.0.0:20777")
+    host, port = _parse_listen(listen)
+
+    replay_path = str(_get(cfg, "replay", "") or "")
+    replay_speed = float(_get(cfg, "replay_speed", 1.0) or 1.0)
+    replay_no_sleep = bool(_get(cfg, "replay_no_sleep", False))
 
     record_enabled = bool(_get(cfg, "record", False))
     record_dir = str(_get(cfg, "record_dir", "recordings") or "recordings")
@@ -67,43 +78,79 @@ async def run_app(args: Any) -> int:
     no_engine = bool(_get(cfg, "no_engine", False))
     rules_path = str(_get(cfg, "rules_path", "rules/v1.json") or "rules/v1.json")
     comm_throttle = float(_get(cfg, "comm_throttle", 0.0) or 0.0)
+
     engine_tick_hz = float(_get(cfg, "engine_tick_hz", 10.0) or 10.0)
     if engine_tick_hz <= 0:
         engine_tick_hz = 10.0
     engine_dt = 1.0 / engine_tick_hz
 
-    # Runtime
     stats = RuntimeStats()
     state_mgr = StateManager()
 
     raw_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_maxsize)
-    dispatch_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=queue_maxsize)
+    dispatch_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=dispatch_maxsize)
 
     stop_evt = asyncio.Event()
 
     dispatcher = PacketDispatcher(
-        expected_packet_format=packet_format,
-        expected_game_year=game_year,
-        stats=stats,
-        state_manager=state_mgr,
-        strict_format=strict_format,
-        strict_game_year=strict_game_year,
+        **_safe_kwargs(
+            PacketDispatcher,
+            expected_packet_format=packet_format,
+            expected_game_year=game_year,
+            stats=stats,
+            state_manager=state_mgr,
+            strict_format=strict_format,
+            strict_game_year=strict_game_year,
+        )
     )
+    dispatcher_task = asyncio.create_task(dispatcher.run(dispatch_queue), name="dispatcher")
 
     recorder = PacketRecorder(
-        out_dir=record_dir,
-        enabled=record_enabled,
-        max_queue=queue_maxsize,
-        stats=stats,
+        **_safe_kwargs(
+            PacketRecorder,
+            out_dir=record_dir,
+            enabled=record_enabled,
+            max_queue=queue_maxsize,
+            queue_maxsize=queue_maxsize,
+            stats=stats,
+        )
     )
+    recorder_task = asyncio.create_task(recorder.run(stop_evt), name="recorder")
 
-    # Reporter de stats (firma REAL)
+    async def _fanout() -> None:
+        while not stop_evt.is_set():
+            data = await raw_queue.get()
+
+            # Contabilizar replay en RuntimeStats (PacketReplayer no conoce RuntimeStats)
+            if replay_path:
+                stats.replay_sent += 1
+
+            if record_enabled:
+                try:
+                    if hasattr(recorder, "try_enqueue"):
+                        recorder.try_enqueue(data)  # type: ignore[attr-defined]
+                    else:
+                        await recorder.enqueue(data)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+            await dispatch_queue.put(data)
+
+    fanout_task = asyncio.create_task(_fanout(), name="fanout")
+
     reporter_task: Optional[asyncio.Task] = None
     if stats_interval > 0:
-        reporter = StatsReporter(stats=stats, state_mgr=state_mgr, interval_s=stats_interval, queue=dispatch_queue)
+        reporter = StatsReporter(
+            **_safe_kwargs(
+                StatsReporter,
+                stats=stats,
+                state_mgr=state_mgr,
+                interval_s=stats_interval,
+                queue=dispatch_queue,
+            )
+        )
         reporter_task = asyncio.create_task(reporter.run(stop_evt), name="stats_reporter")
 
-    # Snapshot de estado (opcional)
     snapshot_task: Optional[asyncio.Task] = None
     if state_interval > 0:
         snap_log = logging.getLogger("ingenierof125.state_snapshot")
@@ -111,60 +158,53 @@ async def run_app(args: Any) -> int:
         async def _snap_loop() -> None:
             while not stop_evt.is_set():
                 await asyncio.sleep(state_interval)
-                snap_log.info(state_mgr.format_one_line())
+                try:
+                    snap_log.info(state_mgr.format_one_line())
+                except Exception:
+                    pass
 
         snapshot_task = asyncio.create_task(_snap_loop(), name="state_snapshot")
 
-    # Engine (usar create(), NO constructor directo)
     engine_task: Optional[asyncio.Task] = None
     if not no_engine:
         try:
             path = rules_path or default_rules_path()
-            rules = load_rules(path)
-            if comm_throttle > 0 and hasattr(rules, "override"):
-                rules = rules.override(throttle_s=comm_throttle)
+            rules_cfg = load_rules(path)
+            if comm_throttle > 0 and hasattr(rules_cfg, "override"):
+                rules_cfg = rules_cfg.override(throttle_s=comm_throttle)
 
-            engine = EngineerEngine.create(rules.as_rule_config(), LoggerComms())
+            engine = EngineerEngine.create(RuleConfig(raw=rules_cfg), LoggerComms())
 
             async def _engine_loop() -> None:
                 loop = asyncio.get_running_loop()
                 while not stop_evt.is_set():
-                    engine.tick(loop.time(), state_mgr.state, float(state_mgr.latest_session_time or 0.0))
+                    engine.tick(state_mgr.state, loop.time())
                     await asyncio.sleep(engine_dt)
 
             engine_task = asyncio.create_task(_engine_loop(), name="engine")
         except Exception:
             log.exception("Engine init failed (continuing without engine)")
 
-    # Tasks
-    dispatcher_task = asyncio.create_task(dispatcher.run(dispatch_queue), name="dispatcher")
-    recorder_task = asyncio.create_task(recorder.run(stop_evt), name="recorder")
-
-    async def _fanout() -> None:
-        # raw -> dispatch (+record) y actualiza replay_sent cuando aplica
-        in_replay = bool(replay_path)
-        while not stop_evt.is_set():
-            data = await raw_queue.get()
-            if in_replay:
-                stats.replay_sent += 1
-            if record_enabled:
-                await recorder.enqueue(data)
-            await dispatch_queue.put(data)
-
-    fanout_task = asyncio.create_task(_fanout(), name="fanout")
-
-    # Source
     if replay_path:
-        src = PacketReplayer(path=replay_path, speed=replay_speed, no_sleep=replay_no_sleep)
+        # NO pasar stats=... (no existe en PacketReplayer del ZIP)
+        src = PacketReplayer(**_safe_kwargs(PacketReplayer, path=replay_path, speed=replay_speed, no_sleep=replay_no_sleep))
         src_task = asyncio.create_task(src.run(raw_queue), name="replay")
     else:
-        src = UdpListener(host=host, port=port, out_queue=raw_queue, drop_when_full=True, stats=stats)
+        src = UdpListener(
+            **_safe_kwargs(
+                UdpListener,
+                host=host,
+                port=port,
+                out_queue=raw_queue,
+                drop_when_full=True,
+                stats=stats,
+            )
+        )
         src_task = asyncio.create_task(src.run(), name="udp")
 
     try:
         await src_task
 
-        # si fue replay, drenamos para que dispatcher/recorder alcancen a procesar el final
         if replay_path:
             while (not raw_queue.empty()) or (not dispatch_queue.empty()):
                 await asyncio.sleep(0.01)
@@ -172,25 +212,20 @@ async def run_app(args: Any) -> int:
 
     finally:
         stop_evt.set()
-        try:
-            dispatcher.stop()
-        except Exception:
-            pass
-        try:
-            recorder.stop()
-        except Exception:
-            pass
-        try:
-            if hasattr(src, "stop"):
-                src.stop()
-        except Exception:
-            pass
+
+        for obj in (dispatcher, recorder, src):
+            try:
+                if hasattr(obj, "stop"):
+                    obj.stop()  # type: ignore[misc]
+            except Exception:
+                pass
+
+        for t in (fanout_task, dispatcher_task, recorder_task, reporter_task, snapshot_task, engine_task):
+            if t is not None:
+                t.cancel()
 
         await asyncio.gather(
-            fanout_task,
-            dispatcher_task,
-            recorder_task,
-            *(t for t in (reporter_task, snapshot_task, engine_task) if t is not None),
+            *(t for t in (fanout_task, dispatcher_task, recorder_task, reporter_task, snapshot_task, engine_task) if t is not None),
             return_exceptions=True,
         )
 
